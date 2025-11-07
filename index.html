@@ -1,0 +1,822 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VIBE 14 - Plataforma de Conexão Musical (DDD 14)</title>
+    <!-- Tailwind CSS CDN -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Configuração da Fonte Inter -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@100..900&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f7f7;
+        }
+        .musico-card {
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -2px rgba(0, 0, 0, 0.06);
+        }
+        .modal-open { overflow: hidden; }
+        .musician-profile-data-entry, .gig-request-form, .auth-form-container {
+            animation: fadeIn 0.5s ease-out;
+        }
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+    </style>
+</head>
+<body class="min-h-screen flex flex-col">
+    <!-- Main Application Container -->
+    <div id="app" class="flex flex-col flex-grow">
+        <!-- Header -->
+        <header class="bg-gray-800 p-4 shadow-lg sticky top-0 z-10">
+            <div class="max-w-7xl mx-auto flex justify-between items-center">
+                <h1 class="text-2xl font-bold text-yellow-400">VIBE 14</h1>
+                <nav id="nav-container" class="space-x-4 text-white">
+                    <!-- Links de Navegação serão injetados aqui -->
+                </nav>
+            </div>
+        </header>
+
+        <!-- Main Content Area -->
+        <main id="content" class="flex-grow max-w-7xl mx-auto w-full p-4 sm:p-6 lg:p-8">
+            <!-- Dynamic content (login, dashboard, profile) will be rendered here -->
+            <div id="loading-spinner" class="text-center mt-20">
+                <div class="animate-spin rounded-full h-16 w-16 border-t-4 border-b-4 border-yellow-500 mx-auto"></div>
+                <p class="mt-4 text-gray-600">Carregando...</p>
+            </div>
+            <div id="auth-view"></div>
+            <div id="dashboard-view"></div>
+            <div id="profile-view"></div>
+            <div id="request-view"></div>
+            <!-- Global Message Box -->
+            <div id="message-box" class="fixed bottom-4 right-4 z-50"></div>
+        </main>
+    </div>
+
+    <!-- Firebase Imports and Setup -->
+    <script type="module">
+        // Importa módulos necessários do Firebase, incluindo Email/Password Auth
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword, onAuthStateChanged, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, doc, setDoc, getDoc, onSnapshot, collection, query, where, updateDoc, addDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Variáveis globais de ambiente (disponíveis no Canvas)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-gigflow-id';
+        const firebaseConfig = typeof __firebase_config !== 'undefined' ? JSON.parse(__firebase_config) : {};
+        // O token personalizado não é mais usado para login principal com e-mail/senha
+        // const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        // Inicialização do Firebase
+        let app, db, auth;
+        let userId = null;
+        let userRole = null; // 'musico' ou 'contratante'
+        let currentUserProfile = null;
+        let currentView = 'home';
+        let allMusicians = [];
+        let receivedRequests = [];
+
+        setLogLevel('Debug'); // Para debug no console
+
+        const loadingSpinner = document.getElementById('loading-spinner');
+        if (Object.keys(firebaseConfig).length > 0) {
+            app = initializeApp(firebaseConfig);
+            db = getFirestore(app);
+            auth = getAuth(app);
+            console.log("Firebase inicializado.");
+            initAuthListener();
+        } else {
+            loadingSpinner.classList.add('hidden');
+            document.getElementById('content').innerHTML = `
+                <div class="bg-red-100 border border-red-400 text-red-700 px-4 py-3 rounded relative" role="alert">
+                    <strong class="font-bold">Erro de Configuração:</strong>
+                    <span class="block sm:inline">As configurações do Firebase não foram carregadas.</span>
+                </div>
+            `;
+        }
+
+        // --- AUTENTICAÇÃO E INICIALIZAÇÃO ---
+
+        function initAuthListener() {
+            onAuthStateChanged(auth, async (user) => {
+                if (user) {
+                    userId = user.uid;
+                    console.log("Usuário autenticado:", userId);
+                    await checkUserRole();
+                } else {
+                    console.log("Usuário deslogado.");
+                    userId = null;
+                    userRole = null;
+                    currentUserProfile = null;
+                    allMusicians = [];
+                    receivedRequests = [];
+                    renderAuthForm('login'); // Leva para a tela de Login
+                }
+                loadingSpinner.classList.add('hidden');
+            });
+        }
+
+        async function checkUserRole() {
+            loadingSpinner.classList.remove('hidden');
+            // Caminho privado para o papel
+            const userDocRef = doc(db, "artifacts", appId, "users", userId);
+            const userDocSnap = await getDoc(userDocRef);
+
+            if (userDocSnap.exists()) {
+                userRole = userDocSnap.data().role;
+                currentUserProfile = userDocSnap.data();
+                console.log("Papel do usuário carregado:", userRole);
+                setupRealtimeListeners();
+                renderUI();
+            } else {
+                // Se o usuário logou/cadastrou, mas ainda não escolheu o papel
+                renderRoleSelection();
+            }
+            loadingSpinner.classList.add('hidden');
+        }
+
+        // --- FUNÇÕES DE AUTENTICAÇÃO (Login/Cadastro) ---
+
+        async function handleRegister(email, password) {
+            try {
+                loadingSpinner.classList.remove('hidden');
+                const userCredential = await createUserWithEmailAndPassword(auth, email, password);
+                // onAuthStateChanged cuidará do resto (redirecionar para checkUserRole)
+                showMessage(`Conta criada com sucesso para ${userCredential.user.email}!`, 'success');
+            } catch (error) {
+                console.error("Erro no cadastro:", error);
+                // Mensagens de erro amigáveis
+                let errorMessage = "Erro ao cadastrar. Tente outro e-mail ou senha.";
+                if (error.code === 'auth/weak-password') {
+                    errorMessage = "A senha deve ter pelo menos 6 caracteres.";
+                } else if (error.code === 'auth/email-already-in-use') {
+                    errorMessage = "Este e-mail já está em uso.";
+                }
+                showMessage(errorMessage, 'error');
+            } finally {
+                 loadingSpinner.classList.add('hidden');
+            }
+        }
+
+        async function handleLogin(email, password) {
+            try {
+                loadingSpinner.classList.remove('hidden');
+                await signInWithEmailAndPassword(auth, email, password);
+                // onAuthStateChanged cuidará do resto
+                showMessage("Login realizado com sucesso!", 'success');
+            } catch (error) {
+                console.error("Erro no login:", error);
+                 // Mensagens de erro amigáveis
+                let errorMessage = "E-mail ou senha incorretos. Tente novamente.";
+                if (error.code === 'auth/user-not-found' || error.code === 'auth/wrong-password') {
+                    errorMessage = "Credenciais inválidas.";
+                }
+                showMessage(errorMessage, 'error');
+            } finally {
+                 loadingSpinner.classList.add('hidden');
+            }
+        }
+
+        function handleSignOut() {
+             signOut(auth).then(() => {
+                console.log("Usuário deslogado.");
+                // onAuthStateChanged chamará renderAuthForm
+             }).catch((error) => {
+                console.error("Erro ao deslogar:", error);
+                showMessage("Erro ao deslogar. Tente novamente.", 'error');
+             });
+        }
+
+
+        // --- UTILITY FUNCTIONS ---
+
+        function showMessage(text, type = 'success') {
+            const box = document.getElementById('message-box');
+            const color = type === 'success' ? 'bg-green-500' : 'bg-red-500';
+            const messageHtml = `
+                <div class="${color} text-white p-3 rounded-xl shadow-lg mb-2 flex items-center transition duration-500 transform translate-y-2 opacity-0" style="min-width: 250px;">
+                    ${text}
+                </div>
+            `;
+            box.insertAdjacentHTML('beforeend', messageHtml);
+            const newMessage = box.lastElementChild;
+            // Força o reflow para aplicar a transição
+            requestAnimationFrame(() => {
+                newMessage.classList.remove('translate-y-2', 'opacity-0');
+            });
+
+            setTimeout(() => {
+                newMessage.classList.add('opacity-0', 'translate-y-2');
+                newMessage.addEventListener('transitionend', () => newMessage.remove());
+            }, 4000);
+        }
+
+        function convertToEmbedUrl(url) {
+            if (!url) return '';
+            let embedUrl = url;
+            if (url.includes('youtube.com/watch?v=')) {
+                embedUrl = url.replace('watch?v=', 'embed/');
+            } else if (url.includes('youtu.be/')) {
+                embedUrl = url.replace('youtu.be/', 'youtube.com/embed/');
+            }
+            const match = embedUrl.match(/embed\/([^&?]+)/);
+            if (match) {
+                embedUrl = `https://www.youtube.com/embed/${match[1]}?autoplay=0&controls=1&modestbranding=1&rel=0`;
+            }
+            return embedUrl.startsWith('http') ? embedUrl : '';
+        }
+
+        function openRequestModal(musicianId, musicianName) {
+            document.getElementById('request-musico-id').value = musicianId;
+            document.querySelector('#request-modal .modal-title').textContent = `Solicitar Show para ${musicianName}`;
+            document.getElementById('request-modal').classList.remove('hidden');
+        }
+
+        function closeModal(id) {
+            document.getElementById(id).classList.add('hidden');
+        }
+
+
+        // --- FIREBASE FIRESTORE LISTENERS (Tempo Real) ---
+
+        function setupRealtimeListeners() {
+            if (!db || !appId || !userId) {
+                console.error("ERRO DE SETUP: Firestore não inicializado ou usuário não logado.");
+                return;
+            }
+
+            // 1. Ouvir mudanças em todos os músicos (para o dashboard)
+            const musiciansCollectionRef = collection(db, "artifacts", appId, "public/data", "musicos");
+            onSnapshot(musiciansCollectionRef, (snapshot) => {
+                allMusicians = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                console.log("Lista de Músicos atualizada. Total:", allMusicians.length);
+                if (currentView === 'home' || currentView === 'dashboard') {
+                    renderDashboard();
+                }
+            }, (error) => {
+                console.error("Erro ao ouvir coleção de músicos (Verifique as regras de segurança):", error);
+                // Esta mensagem é crucial para feedback sobre as regras de segurança.
+                showMessage("Erro de Permissão: Não foi possível carregar a lista de Músicos. Verifique as regras de segurança do Firestore.", 'error');
+            });
+
+            // 2. Ouvir Solicitações de Show para o Músico Atual (Se for músico)
+            if (userRole === 'musico') {
+                const requestsCollectionRef = collection(db, "artifacts", appId, "public/data", "solicitacoes");
+                const q = query(requestsCollectionRef, where("musicoId", "==", userId));
+                onSnapshot(q, (snapshot) => {
+                    receivedRequests = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                    console.log("Solicitações recebidas:", receivedRequests.length);
+                    if (currentView === 'dashboard') {
+                        renderDashboard(); // Re-renderiza o dashboard do músico
+                    }
+                }, (error) => {
+                    console.error("Erro ao ouvir solicitações de show:", error);
+                });
+            }
+        }
+
+
+        // --- RENDERIZAÇÃO DE TELAS ---
+
+        function clearContent() {
+            document.getElementById('auth-view').innerHTML = '';
+            document.getElementById('dashboard-view').innerHTML = '';
+            document.getElementById('profile-view').innerHTML = '';
+            document.getElementById('request-view').innerHTML = '';
+        }
+
+        function renderUI(view = 'dashboard') {
+            currentView = view;
+            clearContent();
+            renderNav();
+
+            if (!userRole) {
+                renderRoleSelection();
+                return;
+            }
+
+            // Pega o perfil mais atualizado
+            const musicianData = allMusicians.find(m => m.id === userId) || currentUserProfile;
+
+            if (userRole === 'musico') {
+                // Se for músico e não tiver nome, força o perfil para preenchimento.
+                if (view === 'profile' || !musicianData.nome) {
+                    renderMusicianProfile(musicianData);
+                } else {
+                    renderDashboard();
+                }
+            } else if (userRole === 'contratante') {
+                renderDashboard();
+            }
+        }
+
+        function renderNav() {
+            const navContainer = document.getElementById('nav-container');
+            let navHtml = '';
+
+            if (userRole) {
+                // Remove o UID completo, pois agora é e-mail e não um token aleatório.
+                navHtml += `
+                    <button onclick="window.appFunctions.renderUI('dashboard')" class="text-white hover:text-yellow-400 transition">Início</button>
+                    ${userRole === 'musico' ? `<button onclick="window.appFunctions.renderUI('profile')" class="text-white hover:text-yellow-400 transition">Meu Perfil</button>` : ''}
+                    <button onclick="window.appFunctions.handleSignOut()" class="text-white hover:text-red-400 transition">Sair</button>
+                `;
+            }
+
+            navContainer.innerHTML = navHtml;
+        }
+
+        // 1. Tela de Login/Cadastro
+        function renderAuthForm(mode = 'login') {
+            clearContent();
+            const authView = document.getElementById('auth-view');
+            const isLogin = mode === 'login';
+
+            authView.innerHTML = `
+                <div class="max-w-md mx-auto mt-16 p-8 bg-white rounded-xl shadow-2xl auth-form-container">
+                    <h2 class="text-3xl font-extrabold text-gray-900 text-center mb-6">${isLogin ? 'Fazer Login' : 'Criar Conta'}</h2>
+
+                    <form id="auth-form" class="space-y-4">
+                        <div>
+                            <label for="email" class="block text-sm font-medium text-gray-700">Email</label>
+                            <input type="email" id="email" required placeholder="seu@email.com"
+                                class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-yellow-500 focus:ring-yellow-500 p-2 border">
+                        </div>
+                        <div>
+                            <label for="password" class="block text-sm font-medium text-gray-700">Senha</label>
+                            <input type="password" id="password" required placeholder="Mínimo 6 caracteres"
+                                class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-yellow-500 focus:ring-yellow-500 p-2 border">
+                        </div>
+
+                        <button type="submit" class="w-full bg-yellow-500 text-white py-3 rounded-xl hover:bg-yellow-600 transition font-bold">
+                            ${isLogin ? 'Entrar no VIBE 14' : 'Cadastrar e Continuar'}
+                        </button>
+                    </form>
+
+                    <p class="text-center text-sm mt-6">
+                        ${isLogin ? 'Ainda não tem conta?' : 'Já tem uma conta?'}
+                        <button onclick="window.appFunctions.renderAuthForm('${isLogin ? 'register' : 'login'}')" class="text-yellow-600 font-semibold hover:text-yellow-700 transition">
+                            ${isLogin ? 'Cadastre-se aqui' : 'Faça login'}
+                        </button>
+                    </p>
+                </div>
+            `;
+
+            document.getElementById('auth-form').addEventListener('submit', (e) => {
+                e.preventDefault();
+                const email = e.target.elements['email'].value;
+                const password = e.target.elements['password'].value;
+                if (isLogin) {
+                    window.appFunctions.handleLogin(email, password);
+                } else {
+                    window.appFunctions.handleRegister(email, password);
+                }
+            });
+        }
+
+
+        // 2. Tela de Seleção de Papel
+        function renderRoleSelection() {
+            clearContent();
+            const authView = document.getElementById('auth-view');
+            authView.innerHTML = `
+                <div class="max-w-xl mx-auto mt-16 p-8 bg-white rounded-xl shadow-2xl musician-profile-data-entry">
+                    <h2 class="text-3xl font-extrabold text-gray-900 text-center mb-6">Escolha Seu Papel</h2>
+                    <p class="text-center text-gray-600 mb-8">Você é um Artista buscando shows ou um Contratante buscando talentos?</p>
+
+                    <div class="flex flex-col sm:flex-row gap-6">
+                        <div onclick="window.appFunctions.selectRole('musico')" class="flex-1 p-6 border-4 border-yellow-500 rounded-xl bg-yellow-50 hover:bg-yellow-100 transition cursor-pointer text-center musico-card">
+                            <svg class="w-12 h-12 mx-auto text-yellow-600 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19V6l12-3v13M9 19h12M9 19c0 1.105-1.79 2-4 2s-4-.895-4-2 1.79-2 4-2 4 .895 4 2zM12 4c0 1.105-1.79 2-4 2s-4-.895-4-2 1.79-2 4-2 4 .895 4 2z"></path></svg>
+                            <h3 class="text-xl font-bold text-gray-800">Músico / Banda</h3>
+                            <p class="text-sm text-gray-600 mt-1">Crie seu perfil, compartilhe seu trabalho e receba propostas de shows.</p>
+                        </div>
+
+                        <div onclick="window.appFunctions.selectRole('contratante')" class="flex-1 p-6 border-4 border-gray-800 rounded-xl bg-gray-100 hover:bg-gray-200 transition cursor-pointer text-center musico-card">
+                            <svg class="w-12 h-12 mx-auto text-gray-700 mb-3" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16m14 0h2m-2 0h-5m-7 0H3m6 0h5M8 6h9m-9 3h9m-9 3h9m-9 3h9"></path></svg>
+                            <h3 class="text-xl font-bold text-gray-800">Contratante</h3>
+                            <p class="text-sm text-gray-600 mt-1">Navegue por perfis, avalie talentos e solicite shows diretamente.</p>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        // 3. Tela de Dashboard (Lista de Músicos ou Solicitações)
+        function renderDashboard() {
+            clearContent();
+            const dashboardView = document.getElementById('dashboard-view');
+            const roleTitle = userRole === 'musico' ? 'Minhas Solicitações de Show' : 'Artistas em Destaque';
+
+            if (userRole === 'musico') {
+                 // Dashboard do Músico: Exibe solicitações recebidas
+                 const requestListHtml = receivedRequests.length > 0
+                    ? receivedRequests.map(renderRequestCard).join('')
+                    : '<p class="text-gray-500 bg-white p-4 rounded-xl shadow">Nenhuma solicitação de show recebida ainda.</p>';
+
+                 dashboardView.innerHTML = `
+                    <h2 class="text-3xl font-bold text-gray-800 mb-6">${roleTitle}</h2>
+                    <div id="requests-list" class="grid grid-cols-1 gap-6 musician-profile-data-entry">
+                        ${requestListHtml}
+                    </div>
+                 `;
+            } else {
+                // Dashboard do Contratante: Exibe lista de músicos
+                const musicianListHtml = allMusicians.length > 0
+                    ? allMusicians.map(m => renderMusicianCard(m)).join('')
+                    : '<p class="text-gray-500">Nenhum músico cadastrado ainda. Seja o primeiro a se juntar!</p>';
+
+                dashboardView.innerHTML = `
+                    <h2 class="text-3xl font-bold text-gray-800 mb-6">${roleTitle}</h2>
+                    <p class="text-gray-600 mb-8">Navegue pelos perfis e encontre o talento perfeito para seu evento.</p>
+                    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 musician-profile-data-entry">
+                        ${musicianListHtml}
+                    </div>
+                `;
+            }
+        }
+
+        function renderMusicianCard(musico) {
+            const defaultAvatar = 'https://placehold.co/100x100/374151/E5E7EB?text=M';
+            return `
+                <div class="bg-white rounded-xl overflow-hidden shadow-lg hover:shadow-xl transition musico-card">
+                    <div class="p-6">
+                        <div class="flex items-start">
+                            <img src="${musico.fotoPerfil || defaultAvatar}" onerror="this.src='${defaultAvatar}'" class="w-16 h-16 rounded-full object-cover mr-4 border-2 border-yellow-400">
+                            <div>
+                                <h3 class="text-xl font-bold text-gray-900">${musico.nome || 'Nome do Artista Pendente'}</h3>
+                                <p class="text-sm text-yellow-600 font-medium">${musico.genero || 'Gênero Musical'}</p>
+                                <p class="text-xs text-gray-500 mt-1">${musico.cidade || 'Cidade não informada'}</p>
+                            </div>
+                        </div>
+                        <p class="mt-4 text-gray-600 line-clamp-3">${musico.bioResumo || 'Este artista ainda não adicionou uma biografia completa.'}</p>
+                        <div class="mt-4">
+                            <button onclick="window.appFunctions.navigateToProfile('${musico.id}')"
+                                class="w-full bg-yellow-500 text-white py-2 rounded-lg font-semibold hover:bg-yellow-600 transition">
+                                Ver Perfil ${userRole === 'contratante' ? '& Contratar' : ''}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
+        }
+
+        function renderRequestCard(request) {
+            const date = new Date(request.dataShow);
+            const formattedDate = date.toLocaleDateString('pt-BR', { day: '2-digit', month: 'short', year: 'numeric' });
+            const statusColor = request.status === 'Pendente' ? 'bg-yellow-100 text-yellow-800' :
+                                request.status === 'Aceito' ? 'bg-green-100 text-green-800' :
+                                'bg-red-100 text-red-800';
+
+            return `
+                <div class="bg-white p-6 rounded-xl shadow-md border-l-4 border-gray-800">
+                    <div class="flex justify-between items-center mb-3">
+                        <h4 class="text-xl font-bold text-gray-800">Proposta de Show (${request.local})</h4>
+                        <span class="text-sm font-medium px-3 py-1 rounded-full ${statusColor}">${request.status}</span>
+                    </div>
+                    <p class="text-gray-600">Data Proposta: <span class="font-semibold">${formattedDate}</span></p>
+                    <p class="text-gray-600">Cachê Oferecido: <span class="font-semibold text-green-700">R$ ${request.cacheProposto.toLocaleString('pt-BR')}</span></p>
+                    <p class="text-xs text-gray-400 mt-2">Contratante ID: ${request.contratanteId}</p>
+
+                    <div class="mt-4 flex space-x-3">
+                        <button onclick="window.appFunctions.updateRequestStatus('${request.id}', 'Aceito')"
+                                class="bg-green-500 text-white px-4 py-2 rounded-lg hover:bg-green-600 transition disabled:opacity-50"
+                                ${request.status !== 'Pendente' ? 'disabled' : ''}>Aceitar</button>
+                        <button onclick="window.appFunctions.updateRequestStatus('${request.id}', 'Rejeitado')"
+                                class="bg-red-500 text-white px-4 py-2 rounded-lg hover:bg-red-600 transition disabled:opacity-50"
+                                ${request.status !== 'Pendente' ? 'disabled' : ''}>Rejeitar</button>
+                    </div>
+                </div>
+            `;
+        }
+
+        // 4. Tela de Perfil Detalhado (Musico ou Contratante vendo Musico)
+        function navigateToProfile(musicianId) {
+             currentView = 'profile';
+             const musician = allMusicians.find(m => m.id === musicianId);
+             if (musician) {
+                renderMusicianProfile(musician, musicianId);
+             } else {
+                showMessage("Músico não encontrado. Voltando ao Dashboard.", 'error');
+                renderUI('dashboard');
+             }
+        }
+
+
+        function renderMusicianProfile(musicianData, musicoId = userId) {
+            clearContent();
+            const profileView = document.getElementById('profile-view');
+            const isEditing = musicoId === userId;
+            const isComplete = musicianData && musicianData.nome && musicianData.genero;
+
+            let profileHtml = '';
+
+            if (isEditing) {
+                // TELA DE EDIÇÃO DO PRÓPRIO MÚSICO
+                profileHtml = `
+                    <h2 class="text-3xl font-bold text-gray-800 mb-6">${isComplete ? 'Editar Meu Perfil' : 'Complete Seu Perfil de Artista'}</h2>
+                    <form id="musician-profile-form" class="bg-white p-6 rounded-xl shadow-lg space-y-4 musician-profile-data-entry">
+                        <input type="hidden" id="musico-id" value="${musicoId}">
+                        <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                            <div>
+                                <label for="nome" class="block text-sm font-medium text-gray-700">Nome da Banda/Artista <span class="text-red-500">*</span></label>
+                                <input type="text" id="nome" value="${musicianData.nome || ''}" required
+                                       class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-yellow-500 focus:ring-yellow-500 p-2 border">
+                            </div>
+                            <div>
+                                <label for="genero" class="block text-sm font-medium text-gray-700">Gênero Principal <span class="text-red-500">*</span></label>
+                                <input type="text" id="genero" value="${musicianData.genero || ''}" required
+                                       class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-yellow-500 focus:ring-yellow-500 p-2 border">
+                            </div>
+                            <div>
+                                <label for="cidade" class="block text-sm font-medium text-gray-700">Cidade de Atuação</label>
+                                <input type="text" id="cidade" value="${musicianData.cidade || ''}"
+                                       class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-yellow-500 focus:ring-yellow-500 p-2 border">
+                            </div>
+                            <div>
+                                <label for="cache-minimo" class="block text-sm font-medium text-gray-700">Cachê Mínimo Sugerido (R$)</label>
+                                <input type="number" id="cache-minimo" value="${musicianData.cacheMinimo || ''}"
+                                       class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-yellow-500 focus:ring-yellow-500 p-2 border">
+                            </div>
+                        </div>
+
+                        <div>
+                            <label for="bio-resumo" class="block text-sm font-medium text-gray-700">Mini Biografia (Max 200 Caracteres)</label>
+                            <textarea id="bio-resumo" maxlength="200" rows="3"
+                                      class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-yellow-500 focus:ring-yellow-500 p-2 border">${musicianData.bioResumo || ''}</textarea>
+                        </div>
+                        <div>
+                            <label for="video-link" class="block text-sm font-medium text-gray-700">Link de Vídeo (YouTube/Vimeo)</label>
+                            <input type="url" id="video-link" value="${musicianData.videoLink || ''}" placeholder="Ex: https://youtube.com/watch?v=..."
+                                   class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-yellow-500 focus:ring-yellow-500 p-2 border">
+                        </div>
+
+                        <button type="submit" class="w-full bg-yellow-500 text-white py-3 rounded-xl font-bold hover:bg-yellow-600 transition mt-6">
+                            Salvar Perfil
+                        </button>
+                        <p id="save-message" class="text-center mt-2 text-sm"></p>
+                    </form>
+                `;
+            } else {
+                // TELA DE VISUALIZAÇÃO PARA CONTRATANTES
+                const profileTitle = musicianData.nome || 'Perfil de Artista (Em Construção)';
+                const formattedCache = musicianData.cacheMinimo ? `R$ ${musicianData.cacheMinimo.toLocaleString('pt-BR')}` : 'A Combinar';
+                const videoEmbed = musicianData.videoLink
+                    ? `<iframe class="w-full aspect-video rounded-xl shadow-lg" src="${convertToEmbedUrl(musicianData.videoLink)}" frameborder="0" allowfullscreen></iframe>`
+                    : `<div class="w-full aspect-video bg-gray-200 flex items-center justify-center rounded-xl shadow-lg text-gray-500">Nenhum vídeo compartilhado ainda.</div>`;
+
+                profileHtml = `
+                    <div class="bg-white p-8 rounded-xl shadow-2xl musician-profile-data-entry">
+                        <div class="flex flex-col sm:flex-row items-start sm:items-center border-b pb-6 mb-6">
+                            <img src="${musicianData.fotoPerfil || 'https://placehold.co/150x150/374151/E5E7EB?text=M'}" onerror="this.src='https://placehold.co/150x150/374151/E5E7EB?text=M'"
+                                 class="w-24 h-24 rounded-full object-cover mr-6 border-4 border-yellow-500 mb-4 sm:mb-0">
+                            <div>
+                                <h2 class="text-4xl font-extrabold text-gray-900">${profileTitle}</h2>
+                                <p class="text-xl text-yellow-600 font-medium mt-1">${musicianData.genero || 'Gênero não especificado'}</p>
+                                <p class="text-md text-gray-500 mt-2">Localização: ${musicianData.cidade || 'Não informada'}</p>
+                            </div>
+                        </div>
+
+                        <div class="grid grid-cols-1 lg:grid-cols-3 gap-8">
+                            <div class="lg:col-span-2 space-y-8">
+                                <!-- Seção de Vídeo -->
+                                <h3 class="text-2xl font-bold text-gray-800 border-b pb-2">Trabalho em Destaque</h3>
+                                ${videoEmbed}
+
+                                <!-- Seção de Biografia -->
+                                <h3 class="text-2xl font-bold text-gray-800 border-b pb-2">Sobre o Artista</h3>
+                                <p class="text-gray-700 whitespace-pre-wrap">${musicianData.bioResumo || 'O artista ainda não adicionou uma biografia completa. Entre em contato para saber mais!'}</p>
+
+                                <!-- Seção de Avaliações (Placeholder) -->
+                                <h3 class="text-2xl font-bold text-gray-800 border-b pb-2">Avaliações</h3>
+                                <div id="reviews-list">
+                                    <p class="text-gray-500">Funcionalidade de Avaliações (estrelas e comentários) será implementada aqui.</p>
+                                </div>
+                            </div>
+
+                            <div class="lg:col-span-1 space-y-6">
+                                <!-- Contratação -->
+                                <div class="bg-yellow-50 p-6 rounded-xl shadow-md border-l-4 border-yellow-500">
+                                    <h4 class="text-xl font-bold text-gray-800 mb-4">Informações de Contratação</h4>
+                                    <p class="text-lg font-medium text-gray-700">Cachê Mínimo:</p>
+                                    <p class="text-2xl font-extrabold text-yellow-700">${formattedCache}</p>
+
+                                    ${userRole === 'contratante' ? `
+                                        <button onclick="window.appFunctions.openRequestModal('${musicoId}', '${profileTitle}')"
+                                                class="w-full mt-4 bg-gray-800 text-white py-3 rounded-lg font-bold hover:bg-gray-700 transition flex items-center justify-center">
+                                            <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7V3m8 4V3m-9 8h.01M17 11h.01M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z"></path></svg>
+                                            Solicitar Show
+                                        </button>
+                                    ` : `
+                                        <p class="text-sm text-gray-500 mt-4">Somente contratantes podem solicitar shows.</p>
+                                    `}
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- Modal de Solicitação de Show -->
+                    <div id="request-modal" class="fixed inset-0 bg-gray-900 bg-opacity-75 z-50 flex items-center justify-center hidden">
+                        <!-- Conteúdo do Modal -->
+                        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-lg mx-4 gig-request-form">
+                            <h3 class="text-2xl font-bold mb-4 modal-title">Solicitar Show</h3>
+                            <form id="show-request-form" class="space-y-4">
+                                <input type="hidden" id="request-musico-id" value="${musicoId}">
+                                <div>
+                                    <label for="request-data" class="block text-sm font-medium text-gray-700">Data do Show</label>
+                                    <input type="date" id="request-data" required class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border">
+                                </div>
+                                <div>
+                                    <label for="request-local" class="block text-sm font-medium text-gray-700">Local da Apresentação</label>
+                                    <input type="text" id="request-local" required placeholder="Ex: Bar do Zé, Centro" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border">
+                                </div>
+                                <div>
+                                    <label for="request-cache" class="block text-sm font-medium text-gray-700">Cachê Proposto (R$)</label>
+                                    <input type="number" id="request-cache" required placeholder="Ex: 1500" class="mt-1 block w-full rounded-md border-gray-300 shadow-sm p-2 border">
+                                </div>
+                                <div class="flex justify-end space-x-4 pt-4">
+                                    <button type="button" onclick="window.appFunctions.closeModal('request-modal')" class="px-4 py-2 text-gray-600 bg-gray-200 rounded-lg hover:bg-gray-300 transition">Cancelar</button>
+                                    <button type="submit" class="px-4 py-2 bg-yellow-500 text-white rounded-lg font-bold hover:bg-yellow-600 transition">Enviar Solicitação</button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                `;
+            }
+
+            profileView.innerHTML = profileHtml;
+
+            // Adiciona listener de submit do formulário de perfil (apenas se for edição)
+            if (isEditing) {
+                const form = document.getElementById('musician-profile-form');
+                if (form) {
+                    form.addEventListener('submit', handleProfileSubmit);
+                }
+            }
+             // Adiciona listener de submit do formulário de solicitação
+             const requestForm = document.getElementById('show-request-form');
+             if (requestForm) {
+                 requestForm.addEventListener('submit', handleRequestSubmit);
+             }
+        }
+
+
+        // --- FUNÇÕES DE LÓGICA DE DADOS ---
+
+        // 1. Seleção de Papel
+        async function selectRole(role) {
+            userRole = role;
+            const userDocRef = doc(db, "artifacts", appId, "users", userId);
+
+            try {
+                loadingSpinner.classList.remove('hidden');
+                // 1. Armazena o papel no caminho privado (users/{userId})
+                await setDoc(userDocRef, { role: role, uid: userId, email: auth.currentUser.email, createdAt: new Date().toISOString() }, { merge: true });
+
+                // 2. Se for músico, cria um perfil básico no caminho público (musicos/{musicoId})
+                if (role === 'musico') {
+                    const musicianDocRef = doc(db, "artifacts", appId, "public/data", "musicos", userId);
+                    await setDoc(musicianDocRef, {
+                        nome: '',
+                        genero: '',
+                        cidade: '',
+                        cacheMinimo: 0,
+                        bioResumo: '',
+                        videoLink: '',
+                        email: auth.currentUser.email // Opcional, para facilitar a busca/contato
+                    }, { merge: true });
+                }
+
+                // Força o recarregamento do papel e UI
+                await checkUserRole();
+
+            } catch (error) {
+                console.error("Erro ao definir o papel:", error);
+                showMessage("Erro ao salvar seu papel. Tente novamente.", 'error');
+            } finally {
+                loadingSpinner.classList.add('hidden');
+            }
+        }
+
+        // 2. Submissão do Perfil do Músico
+        async function handleProfileSubmit(event) {
+            event.preventDefault();
+            const form = event.target;
+            const musicoId = form.elements['musico-id'].value;
+            const messageElement = document.getElementById('save-message');
+            messageElement.className = 'text-center mt-2 text-yellow-600';
+            messageElement.textContent = 'Salvando perfil...';
+
+            const newProfileData = {
+                nome: form.elements['nome'].value,
+                genero: form.elements['genero'].value,
+                cidade: form.elements['cidade'].value,
+                cacheMinimo: parseInt(form.elements['cache-minimo'].value) || 0,
+                bioResumo: form.elements['bio-resumo'].value,
+                videoLink: form.elements['video-link'].value,
+            };
+
+            if (!newProfileData.nome || !newProfileData.genero) {
+                messageElement.className = 'text-center mt-2 text-red-500';
+                messageElement.textContent = 'Nome e Gênero são campos obrigatórios.';
+                return;
+            }
+
+            try {
+                // Salva no perfil público do músico
+                const musicianDocRef = doc(db, "artifacts", appId, "public/data", "musicos", musicoId);
+                await setDoc(musicianDocRef, newProfileData, { merge: true });
+
+                // Atualiza o perfil local
+                currentUserProfile = { ...currentUserProfile, ...newProfileData };
+
+                messageElement.className = 'text-center mt-2 text-green-500';
+                messageElement.textContent = 'Perfil salvo com sucesso!';
+
+                // Após salvar, atualiza a UI
+                setTimeout(() => renderUI('dashboard'), 1500);
+
+            } catch (error) {
+                console.error("Erro ao salvar o perfil:", error);
+                messageElement.className = 'text-center mt-2 text-red-500';
+                messageElement.textContent = 'Erro ao salvar: Verifique as regras de segurança para /musicos.';
+            }
+        }
+
+        // 3. Submissão de Solicitação de Show (Feito pelo Contratante)
+        async function handleRequestSubmit(event) {
+            event.preventDefault();
+            const form = event.target;
+
+            const cacheValue = parseInt(form.elements['request-cache'].value);
+
+            const requestData = {
+                musicoId: form.elements['request-musico-id'].value,
+                contratanteId: userId,
+                dataShow: form.elements['request-data'].value,
+                local: form.elements['request-local'].value,
+                cacheProposto: isNaN(cacheValue) ? 0 : cacheValue,
+                status: 'Pendente', // Status inicial: Pendente
+                dataCriacao: new Date().toISOString()
+            };
+
+            if (!requestData.dataShow || !requestData.local || !requestData.cacheProposto) {
+                 showMessage("Preencha todos os campos obrigatórios: Data, Local e Cachê Proposto.", 'error');
+                 return;
+            }
+
+            try {
+                // Cria a solicitação na coleção pública de solicitações
+                const requestsCollectionRef = collection(db, "artifacts", appId, "public/data", "solicitacoes");
+                await addDoc(requestsCollectionRef, requestData);
+
+                showMessage("Solicitação de show enviada com sucesso! O artista será notificado em tempo real.", 'success');
+                window.appFunctions.closeModal('request-modal');
+                form.reset(); // Limpa o formulário
+
+            } catch (error) {
+                console.error("Erro ao enviar solicitação:", error);
+                showMessage("Erro ao enviar solicitação. Verifique as regras de segurança para /solicitacoes.", 'error');
+            }
+        }
+
+        // 4. Mudar Status da Solicitação (Feito pelo Músico)
+        async function updateRequestStatus(requestId, newStatus) {
+            if (userRole !== 'musico') {
+                showMessage("Apenas Músicos podem alterar o status das solicitações.", 'error');
+                return;
+            }
+
+            try {
+                const requestDocRef = doc(db, "artifacts", appId, "public/data", "solicitacoes", requestId);
+                await updateDoc(requestDocRef, {
+                    status: newStatus,
+                    dataResposta: new Date().toISOString()
+                });
+
+                showMessage(`Solicitação ${newStatus} com sucesso!`, 'success');
+            } catch (error) {
+                console.error("Erro ao atualizar status:", error);
+                showMessage("Erro ao atualizar o status. Verifique as regras de segurança.", 'error');
+            }
+        }
+
+        // Exporta funções para acesso no escopo global (para onClicks)
+        window.appFunctions = {
+            handleLogin,
+            handleRegister,
+            renderAuthForm,
+            selectRole,
+            handleProfileSubmit,
+            handleSignOut,
+            renderUI,
+            navigateToProfile,
+            openRequestModal,
+            closeModal,
+            handleRequestSubmit,
+            updateRequestStatus
+        };
+    </script>
+</body>
+</html>
